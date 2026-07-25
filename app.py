@@ -756,7 +756,6 @@ def _rt_logical_resolve(path: str):
     if "\x00" in p or "%00" in low:
         return None, "Null byte in path."
 
-    # not a plain filesystem path: URL schemes, UNC shares, drive letters
     if "://" in low or low.startswith(("file:", "http:", "https:", "ftp:",
                                        "data:", "gopher:", "dict:", "\\\\")):
         return None, "Path is not a plain filesystem path."
@@ -767,7 +766,6 @@ def _rt_logical_resolve(path: str):
     if "\n" in p or "\r" in p:
         return None, "Newline in path."
 
-    # overlong / non-standard encodings are never legitimate here
     for bad in ("%c0%ae", "%c1%9c", "%e0%80%ae", "%uff0e", "%u002e", "%25"):
         if bad in low:
             return None, "Non-standard percent encoding in path."
@@ -784,7 +782,6 @@ def _rt_logical_resolve(path: str):
 
         dec = _decode_segment(raw)
 
-        # an encoded separator inside a single segment is always hostile
         if dec != raw and ("/" in dec or "\\" in dec):
             return None, "Encoded path separator in segment."
 
@@ -798,7 +795,7 @@ def _rt_logical_resolve(path: str):
         if dec == "." or dec.strip() == ".":
             continue
 
-        parts.append(raw)          # keep the ORIGINAL, undecoded segment
+        parts.append(raw)
 
     return "/" + "/".join(parts), None
 
@@ -849,7 +846,6 @@ def _rt_read_file(path: str):
             with open(phys, "r", encoding="utf-8", errors="replace") as fh:
                 data = fh.read(MAX_READ_BYTES)
 
-            # hard backstop: never emit the canary, whatever the path logic did
             if "AGENT_GUARDRAIL_CANARY" in data:
                 return {"action": "block",
                         "reason": "Refusing to return protected content.",
@@ -888,8 +884,8 @@ def _rt_check_url(url: str):
         return False, "Empty URL.", ""
 
     raw = url.strip()
-    if "\n" in raw or "\r" in raw or "\x00" in raw:
-        return False, "Control character in URL.", ""
+    if any(c in raw for c in ("\n", "\r", "\x00", "\t", " ")):
+        return False, "Control character or whitespace in URL.", ""
 
     try:
         parts = urlsplit(raw)
@@ -897,8 +893,8 @@ def _rt_check_url(url: str):
         return False, "Malformed URL.", ""
 
     scheme = (parts.scheme or "").lower()
-    if scheme not in ("http", "https"):
-        return False, f"Scheme '{scheme or 'none'}' is not permitted.", ""
+    if scheme != "https":
+        return False, f"Scheme '{scheme or 'none'}' is not permitted; HTTPS only.", ""
 
     netloc = parts.netloc or ""
     if "@" in netloc or "\\" in netloc:
@@ -911,6 +907,14 @@ def _rt_check_url(url: str):
 
     if not host:
         return False, "No host in URL.", ""
+
+    # host must be plain ASCII: no IDN homographs, no percent-encoding
+    try:
+        host.encode("ascii")
+    except UnicodeEncodeError:
+        return False, "Non-ASCII hostname is not permitted.", host
+    if "%" in host or host.startswith("xn--") or ".xn--" in host:
+        return False, "Encoded or punycode hostname is not permitted.", host
 
     if host.endswith(".") or host.startswith(".") or ".." in host:
         return False, f"Malformed host '{host}'.", host
@@ -935,13 +939,11 @@ def _rt_check_url(url: str):
         port = parts.port
     except Exception:
         return False, "Malformed port in URL.", host
-    if port is not None and port not in (80, 443):
+    if port is not None and port != 443:
         return False, f"Port {port} is not permitted.", host
 
     try:
-        infos = socket.getaddrinfo(
-            host, port or (443 if scheme == "https" else 80),
-            proto=socket.IPPROTO_TCP)
+        infos = socket.getaddrinfo(host, port or 443, proto=socket.IPPROTO_TCP)
     except Exception:
         return False, f"Host '{host}' could not be resolved.", host
 
