@@ -210,10 +210,8 @@ def is_restricted_read(path: str, shell: bool = False) -> bool:
 
 
 def is_write_allowed(path: str, shell: bool = False) -> bool:
-    """Absolute paths judged as-is. Bare relative paths resolve under WRITE_ROOT."""
-    raw = _expand(str(path).strip())
-    cwd = AGENT_CWD if (raw.startswith("/") or raw.startswith("..")) else WRITE_ROOT
-    n = normalize_path(path, cwd=cwd, shell=shell)
+    """Strict: the resolved path must land inside /srv/reports/."""
+    n = normalize_path(path, shell=shell)
     if ".." in n.split("/"):
         return False
     return n == WRITE_ROOT or n.startswith(WRITE_ROOT + "/")
@@ -288,18 +286,15 @@ def scan_bash(command: str, depth: int = 0) -> Optional[str]:
             if s in low:
                 return f"Reading {s} is never permitted by this agent's policy."
 
-        # writes via shell redirection / tee
+        # writes via shell redirection / tee — strict /srv/reports only
         for m in re.finditer(r"(?:>>?|\btee\b\s+(?:-a\s+)?)\s*([^\s;|&<>\"']+)", v):
             target = m.group(1)
             if target.startswith("/dev/") or target in ("&1", "&2"):
                 continue
-            n = normalize_path(target, shell=True)
-            inside_reports = n == WRITE_ROOT or n.startswith(WRITE_ROOT + "/")
-            inside_home = n == AGENT_HOME or n.startswith(AGENT_HOME + "/")
-            if is_restricted_read(n):
+            if is_restricted_read(target, shell=True):
                 return "Write target is a restricted file."
-            if not (inside_reports or inside_home):
-                return "Writes outside /srv/reports/ and the agent's own home are not permitted."
+            if not is_write_allowed(target, shell=True):
+                return "Writes are permitted only inside /srv/reports/."
 
         for m in re.finditer(r"https?://[^\s;|&<>\"'`]+", v, re.IGNORECASE):
             ok, why = check_host(m.group(0))
