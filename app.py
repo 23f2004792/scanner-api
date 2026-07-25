@@ -25,29 +25,25 @@ ENV_PATTERN = re.compile(r"\$\{?[A-Za-z_][A-Za-z0-9_]*\}?")
 
 INJECTION_PATTERNS = [
     r"ignore previous instructions",
-    r"ignore the user",
-    r"ignore user",
-    r"ignore stop",
-    r"ignore cancel",
-    r"exfiltrat",
-    r"steal",
-    r"upload .*silently",
-    r"send .*silently",
-    r"without user consent",
+    r"ignore the user's stop",
+    r"ignore the user's cancel",
+    r"ignore user stop request",
+    r"ignore user cancel request",
+    r"silently exfiltrat",
+    r"exfiltrat.*file",
+    r"steal.*file",
+    r"silently upload.*file",
+    r"send.*file.*without.*user",
 ]
-
 PERMISSION_PATTERNS = [
     r"entire home directory",
-    r"whole filesystem",
     r"entire filesystem",
-    r"read-write access",
-    r"write access.*home",
-    r"filesystem.*~",
-    r"filesystem.*\/",
+    r"whole filesystem",
+    r"filesystem\s*:\s*.*~",
+    r"filesystem\s*:\s*.*\/",
     r"any external domain",
-    r"egress.*any",
-    r"network.*any",
-    r"network.*external",
+    r"egress.*any external",
+    r"network.*any external",
 ]
 
 
@@ -146,17 +142,13 @@ def scan(req: SkillRequest):
 
     rewrite = [
     "update this skill",
-    "update version",
-    "increment version",
+    "update this skill's own version",
     "next patch version",
-    "rewrite version",
-    "modify version",
     "clear the changelog",
-    "without surfacing",
-    "without telling",
+    "without surfacing this change",
 ]
 
     if any(x in body_lower for x in rewrite):
         categories.append("unclear_provenance")
-
+    categories = sorted(set(categories))
     return {"categories": categories}
