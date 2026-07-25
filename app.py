@@ -350,3 +350,113 @@ async def guardrail(request: Request):
         return {"decision": "allow" if ok else "block", "reason": why}
 
     return {"decision": "block", "reason": "Unrecognized tool; blocked by default."}
+
+# ============================================================
+# Run budget & loop guard endpoint
+# ============================================================
+
+import json as _json
+
+DEFAULT_BUDGET = 18000
+TRACE_KEYS = {"trace_id"}
+
+
+def _canon(value):
+    """Recursively canonicalize args: drop trace_id, collapse whitespace in strings."""
+    if isinstance(value, dict):
+        return {
+            str(k): _canon(v)
+            for k, v in sorted(value.items(), key=lambda kv: str(kv[0]))
+            if str(k).strip().lower() not in TRACE_KEYS
+        }
+    if isinstance(value, list):
+        return [_canon(v) for v in value]
+    if isinstance(value, str):
+        return " ".join(value.split())
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        # 3 and 3.0 should compare equal
+        return float(value) if isinstance(value, float) and not value.is_integer() else int(value) if float(value).is_integer() else float(value)
+    return value
+
+
+def _sig(step):
+    """Stable signature for one step: tool name + canonical args."""
+    if not isinstance(step, dict):
+        return "?"
+    tool = str(step.get("tool", "")).strip()
+    args = step.get("args", {})
+    if not isinstance(args, (dict, list)):
+        args = {"_": args}
+    return tool + "|" + _json.dumps(_canon(args), sort_keys=True, separators=(",", ":"))
+
+
+def _to_int(v):
+    try:
+        return int(float(v))
+    except Exception:
+        return 0
+
+
+@app.post("/runguard")
+async def runguard(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+
+    budget = body.get("budget_tokens", DEFAULT_BUDGET)
+    budget = _to_int(budget) or DEFAULT_BUDGET
+
+    steps = body.get("steps") or []
+    if not isinstance(steps, list):
+        steps = []
+
+    # ---------- budget rule ----------
+    total = sum(_to_int(s.get("tokens_used", 0)) for s in steps if isinstance(s, dict))
+    if total >= budget:
+        return {
+            "decision": "halt",
+            "reason": f"Cumulative tokens_used ({total}) has reached the budget ({budget}).",
+        }
+
+    sigs = [_sig(s) for s in steps]
+
+    # ---------- loop rule 1: 3+ identical calls in a row (trailing) ----------
+    if len(sigs) >= 3:
+        run = 1
+        for i in range(len(sigs) - 1, 0, -1):
+            if sigs[i] == sigs[i - 1]:
+                run += 1
+            else:
+                break
+        if run >= 3:
+            return {
+                "decision": "halt",
+                "reason": f"The same tool call repeated {run} times in a row with functionally identical arguments.",
+            }
+
+    # ---------- loop rule 2: 2-step A/B cycle over 6+ trailing steps ----------
+    if len(sigs) >= 6:
+        tail = sigs[-6:]
+        a, b = tail[0], tail[1]
+        if a != b and all(tail[i] == (a if i % 2 == 0 else b) for i in range(6)):
+            return {
+                "decision": "halt",
+                "reason": "Trailing steps form a repeating 2-step A/B cycle across 6 steps with no progress.",
+            }
+
+    remaining = budget - total
+    if not steps:
+        return {
+            "decision": "continue",
+            "reason": f"Fresh run with no steps taken yet; full budget of {budget} tokens available.",
+        }
+
+    return {
+        "decision": "continue",
+        "reason": f"{remaining} tokens remain and the trailing steps show progress, not a loop.",
+    }
