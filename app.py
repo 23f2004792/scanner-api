@@ -142,10 +142,13 @@ def prorate(req: ProrationRequest):
     return {"charge": delta * (req.days_remaining / divisor)}
 
 
+# ============================================================
+# Agent guardrail endpoint
+# ============================================================
+
 import base64 as _b64
-import os
 import posixpath
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 from typing import Optional
 
 RESTRICTED_FILE = "/home/agent/.secrets"
@@ -154,7 +157,6 @@ AGENT_CWD = "/home/agent/workspace"
 WRITE_ROOT = "/srv/reports"
 ALLOWED_HOSTS = {"api.github.com", "objects.githubusercontent.com"}
 
-# Extra system files no agent should read (per the worked example)
 SENSITIVE_EXTRA = (
     "/etc/shadow", "/etc/sudoers", "/etc/gshadow",
     "/root/.ssh", "/.aws/credentials", "id_rsa", "id_ed25519",
@@ -171,28 +173,48 @@ def _expand(path: str) -> str:
     return p
 
 
-def normalize_path(path: str, cwd: str = AGENT_CWD) -> str:
-    """Expand, make absolute relative to cwd, collapse .. and . segments."""
+def normalize_path(path: str, cwd: str = AGENT_CWD, shell: bool = False) -> str:
+    """Expand, decode, make absolute, and collapse traversal segments."""
     p = _expand(path)
-    p = p.replace("\\", "")          # drop shell escaping backslashes
+
+    # decode percent-encoding repeatedly (%252e -> %2e -> .)
+    for _ in range(3):
+        dec = unquote(p)
+        if dec == p:
+            break
+        p = dec
+
+    p = p.replace("\x00", "")
+
+    if shell:
+        p = p.replace("\\", "")       # undo shell escaping in bash text
+    else:
+        p = p.replace("\\", "/")      # backslash is a separator in a path field
+
+    # collapse padded-dot traversal: /.../ or /..../ -> /../
+    p = re.sub(r"/\.{3,}(?=/|$)", "/..", p)
+
     if not p.startswith("/"):
         p = posixpath.join(cwd, p)
+
     p = posixpath.normpath(p)
     while "//" in p:
         p = p.replace("//", "/")
     return p.rstrip("/") or "/"
 
 
-def is_restricted_read(path: str) -> bool:
-    n = normalize_path(path)
+def is_restricted_read(path: str, shell: bool = False) -> bool:
+    n = normalize_path(path, shell=shell)
     if n == RESTRICTED_FILE or n.startswith(RESTRICTED_FILE + "/"):
         return True
     low = n.lower()
     return any(s in low for s in SENSITIVE_EXTRA)
 
 
-def is_write_allowed(path: str) -> bool:
-    n = normalize_path(path)
+def is_write_allowed(path: str, shell: bool = False) -> bool:
+    n = normalize_path(path, shell=shell)
+    if ".." in n.split("/"):          # anything unresolved is suspect
+        return False
     return n == WRITE_ROOT or n.startswith(WRITE_ROOT + "/")
 
 
@@ -211,67 +233,11 @@ def _decode_b64_blobs(text: str):
 
 
 def _deobfuscate(cmd: str) -> str:
-    """Strip quoting/concatenation tricks so 'cat /home/agent/.sec'\"rets\" matches."""
+    """Strip quoting/concatenation tricks so cat /home/agent/.sec'rets' still matches."""
     s = cmd.replace("\\\n", " ")
-    s = re.sub(r"[\"']", "", s)   # cat /ho'me'/agent/.secrets -> cat /home/agent/.secrets
+    s = re.sub(r"[\"']", "", s)
     s = s.replace("\\", "")
     return s
-
-
-def scan_bash(command: str, depth: int = 0) -> Optional[str]:
-    """Return a block reason, or None if the command looks acceptable."""
-    if depth > 3:
-        return None
-
-    variants = {command, _deobfuscate(command)}
-    for v in list(variants):
-        variants.add(_expand(v))
-        variants.add(v.replace("${HOME}", AGENT_HOME).replace("$HOME", AGENT_HOME))
-
-    for v in variants:
-        low = v.lower()
-
-        # --- restricted secret file, any spelling ---
-        for m in re.finditer(r"(?:~|\$\{?HOME\}?|/home/agent|\.{1,2}/[^\s;|&<>\"']*|/)?[^\s;|&<>\"'`$()]*\.secrets[^\s;|&<>\"'`]*", v, re.IGNORECASE):
-            if is_restricted_read(m.group(0)):
-                return "Access to /home/agent/.secrets is never permitted by this agent's policy."
-        if ".secrets" in low:
-            return "Access to /home/agent/.secrets is never permitted by this agent's policy."
-
-        # relative traversal that lands on the secret even without the literal name
-        for tok in re.findall(r"[~$./][^\s;|&<>\"'`]*", v):
-            try:
-                if is_restricted_read(tok):
-                    return "Path resolves to a restricted file outside the agent's permitted scope."
-            except Exception:
-                pass
-
-        # other sensitive system files (e.g. /etc/shadow)
-        for s in SENSITIVE_EXTRA:
-            if s in low:
-                return f"Reading {s} is never permitted by this agent's policy."
-
-        # --- writes via shell redirection / tee / cp / mv ---
-        for m in re.finditer(r"(?:>>?|\btee\b\s+(?:-a\s+)?)\s*([^\s;|&<>\"']+)", v):
-            target = m.group(1)
-            if target.startswith("/dev/") or target in ("&1", "&2"):
-                continue
-            if not is_write_allowed(target):
-                return "Writes are permitted only inside /srv/reports/."
-
-        # --- network egress from inside bash ---
-        for m in re.finditer(r"https?://[^\s;|&<>\"'`]+", v, re.IGNORECASE):
-            ok, why = check_host(m.group(0))
-            if not ok:
-                return why
-
-    # --- base64 / encoded wrappers: decode and re-scan ---
-    for decoded in _decode_b64_blobs(command):
-        r = scan_bash(decoded, depth + 1)
-        if r:
-            return "Encoded command wraps a disallowed action: " + r
-
-    return None
 
 
 def check_host(url: str):
@@ -287,10 +253,64 @@ def check_host(url: str):
     if not host:
         return False, "Could not determine request host."
 
-    # exact match only — subdomain prefixes and lookalike suffixes are rejected
     if host in ALLOWED_HOSTS:
         return True, f"Host {host} is on the allowlist."
-    return False, f"Host {host} is not on the allowlist (api.github.com, objects.githubusercontent.com)."
+    return False, (
+        f"Host {host} is not on the allowlist "
+        "(api.github.com, objects.githubusercontent.com)."
+    )
+
+
+def scan_bash(command: str, depth: int = 0) -> Optional[str]:
+    """Return a block reason, or None if the command looks acceptable."""
+    if depth > 3:
+        return None
+
+    variants = {command, _deobfuscate(command)}
+    for v in list(variants):
+        variants.add(_expand(v))
+
+    for v in variants:
+        low = v.lower()
+
+        # --- restricted secret file, any spelling ---
+        if ".secrets" in low:
+            return "Access to /home/agent/.secrets is never permitted by this agent's policy."
+
+        # relative traversal that resolves onto the secret
+        for tok in re.findall(r"[~$./][^\s;|&<>\"'`]*", v):
+            try:
+                if is_restricted_read(tok, shell=True):
+                    return "Path resolves to a restricted file outside the agent's permitted scope."
+            except Exception:
+                pass
+
+        # other sensitive system files (e.g. /etc/shadow)
+        for s in SENSITIVE_EXTRA:
+            if s in low:
+                return f"Reading {s} is never permitted by this agent's policy."
+
+        # --- writes via shell redirection / tee ---
+        for m in re.finditer(r"(?:>>?|\btee\b\s+(?:-a\s+)?)\s*([^\s;|&<>\"']+)", v):
+            target = m.group(1)
+            if target.startswith("/dev/") or target in ("&1", "&2"):
+                continue
+            if not is_write_allowed(target, shell=True):
+                return "Writes are permitted only inside /srv/reports/."
+
+        # --- network egress from inside bash ---
+        for m in re.finditer(r"https?://[^\s;|&<>\"'`]+", v, re.IGNORECASE):
+            ok, why = check_host(m.group(0))
+            if not ok:
+                return why
+
+    # --- base64 / encoded wrappers: decode and re-scan ---
+    for decoded in _decode_b64_blobs(command):
+        r = scan_bash(decoded, depth + 1)
+        if r:
+            return "Encoded command wraps a disallowed action: " + r
+
+    return None
 
 
 @app.post("/guardrail")
@@ -309,15 +329,24 @@ async def guardrail(request: Request):
         reason = scan_bash(cmd)
         if reason:
             return {"decision": "block", "reason": reason}
-        return {"decision": "allow", "reason": "Command does not touch restricted paths, write boundaries, or disallowed hosts."}
+        return {
+            "decision": "allow",
+            "reason": "Command does not touch restricted paths, write boundaries, or disallowed hosts.",
+        }
 
     if tool == "write_file":
         path = str(body.get("path", "") or "")
         if is_restricted_read(path):
             return {"decision": "block", "reason": "Path targets a restricted file."}
         if is_write_allowed(path):
-            return {"decision": "allow", "reason": f"Write target resolves inside {WRITE_ROOT}/."}
-        return {"decision": "block", "reason": f"Write target resolves to {normalize_path(path)}, outside the permitted {WRITE_ROOT}/ directory."}
+            return {
+                "decision": "allow",
+                "reason": f"Write target resolves inside {WRITE_ROOT}/.",
+            }
+        return {
+            "decision": "block",
+            "reason": f"Write target resolves to {normalize_path(path)}, outside the permitted {WRITE_ROOT}/ directory.",
+        }
 
     if tool == "http_request":
         url = str(body.get("url", "") or "")
