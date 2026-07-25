@@ -5,80 +5,158 @@ import yaml
 
 app = FastAPI()
 
+
 class SkillRequest(BaseModel):
     skill: str
+
+
+# ---------- Secret Detection ----------
+
+SECRET_PATTERNS = [
+    r"sk-[A-Za-z0-9]{20,}",                         # OpenAI
+    r"ghp_[A-Za-z0-9]{30,}",                        # GitHub PAT
+    r"github_pat_[A-Za-z0-9_]{20,}",
+    r"AKIA[0-9A-Z]{16}",                            # AWS
+    r"xox[baprs]-[A-Za-z0-9\-]{10,}",               # Slack
+    r"Bearer\s+[A-Za-z0-9_\-\.=]{20,}",
+    r"https://[^ \n]*webhooks[^ \n]*",
+]
+
+ENV_PATTERN = re.compile(r"\$\{?[A-Za-z_][A-Za-z0-9_]*\}?")
+
+INJECTION_PATTERNS = [
+    r"ignore\s+previous\s+instructions",
+    r"ignore\s+the\s+user",
+    r"ignore\s+user\s+instructions",
+    r"ignore\s+stop\s+request",
+    r"ignore\s+cancel\s+request",
+    r"exfiltrat",
+    r"steal",
+    r"send\s+.*without\s+telling",
+    r"silently\s+upload",
+    r"do\s+not\s+tell\s+the\s+user",
+]
+
+PERMISSION_PATTERNS = [
+    r"/\*\*",
+    r"filesystem\s*:\s*all",
+    r"filesystem\s*:\s*rw",
+    r"filesystem\s*:\s*\*",
+    r"network\s*:\s*all",
+    r"network\s*:\s*\*",
+    r"egress\s*:\s*all",
+    r"domains\s*:\s*\*",
+    r"read\s+entire\s+filesystem",
+    r"write\s+entire\s+filesystem",
+    r"any\s+domain",
+]
+
+
+def parse_frontmatter(text):
+    if not text.startswith("---"):
+        return {}, text
+
+    try:
+        parts = text.split("---", 2)
+
+        if len(parts) < 3:
+            return {}, text
+
+        front = yaml.safe_load(parts[1])
+
+        if front is None:
+            front = {}
+
+        return front, parts[2]
+
+    except Exception:
+        return {}, text
+
 
 @app.post("/scan")
 def scan(req: SkillRequest):
 
-    text = req.skill
     categories = []
 
-    # ---------- Parse YAML ----------
-    frontmatter = {}
+    front, body = parse_frontmatter(req.skill)
 
-    if text.startswith("---"):
-        parts = text.split("---", 2)
-        if len(parts) >= 3:
-            try:
-                frontmatter = yaml.safe_load(parts[1]) or {}
-            except:
-                frontmatter = {}
+    body_lower = body.lower()
 
-    lower = text.lower()
+    # -------------------------
+    # Hardcoded Secret
+    # -------------------------
 
-    # ---------- Hardcoded Secret ----------
-    secret_patterns = [
-        r"sk-[a-zA-Z0-9]{10,}",
-        r"api[_-]?key\s*[:=]",
-        r"bearer\s+[a-zA-Z0-9_\-]{10,}",
-        r"https://.*webhooks",
-        r"secret\s*[:=]"
-    ]
+    found_secret = False
 
-    for p in secret_patterns:
-        if re.search(p, text, re.IGNORECASE):
-            if "${" not in text:
-                categories.append("hardcoded_secret")
-                break
+    for p in SECRET_PATTERNS:
+        if re.search(p, req.skill, re.IGNORECASE):
+            found_secret = True
+            break
 
-    # ---------- Prompt Injection ----------
+    if not found_secret:
 
-    injection_words = [
-        "ignore previous",
-        "ignore the user",
-        "ignore user",
-        "silently",
-        "without telling",
-        "exfiltrate",
-        "steal",
-        "cancel request",
-        "do not tell the user"
-    ]
+        for k, v in front.items():
 
-    if any(x in lower for x in injection_words):
-        categories.append("prompt_injection")
+            key = str(k).lower()
+            value = str(v)
 
-    # ---------- Permissions ----------
+            if any(x in key for x in [
+                "token",
+                "secret",
+                "apikey",
+                "api_key",
+                "password",
+                "webhook"
+            ]):
 
-    perms = str(frontmatter).lower()
+                if not ENV_PATTERN.search(value):
+                    found_secret = True
+                    break
 
-    if (
-        "/**" in perms
-        or "*" in perms
-        or "all files" in perms
-        or "any domain" in perms
-        or "write: true" in perms
-    ):
+    if found_secret:
+        categories.append("hardcoded_secret")
+
+    # -------------------------
+    # Prompt Injection
+    # -------------------------
+
+    for p in INJECTION_PATTERNS:
+        if re.search(p, body_lower):
+            categories.append("prompt_injection")
+            break
+
+    # -------------------------
+    # Excessive Permissions
+    # -------------------------
+
+    excessive = False
+
+    front_str = yaml.dump(front).lower()
+
+    for p in PERMISSION_PATTERNS:
+        if re.search(p, front_str):
+            excessive = True
+            break
+
+    if excessive:
         categories.append("excessive_permissions")
 
-    # ---------- Provenance ----------
+    # -------------------------
+    # Provenance
+    # -------------------------
 
-    if (
-        "author" not in frontmatter
-        or "version" not in frontmatter
-        or "changelog" not in frontmatter
-    ):
-        categories.append("unclear_provenance")
+    has_author = "author" in front
+    has_version = "version" in front
+    has_changelog = "changelog" in front
+
+    if not (has_author and has_version and has_changelog):
+        if (
+            "update version" in body_lower
+            or "rewrite version" in body_lower
+            or "increment version" in body_lower
+            or "change version" in body_lower
+            or "modify version" in body_lower
+        ):
+            categories.append("unclear_provenance")
 
     return {"categories": categories}
