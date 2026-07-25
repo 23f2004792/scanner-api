@@ -13,42 +13,41 @@ class SkillRequest(BaseModel):
 # ---------- Secret Detection ----------
 
 SECRET_PATTERNS = [
-    r"sk-[A-Za-z0-9]{20,}",                         # OpenAI
-    r"ghp_[A-Za-z0-9]{30,}",                        # GitHub PAT
-    r"github_pat_[A-Za-z0-9_]{20,}",
-    r"AKIA[0-9A-Z]{16}",                            # AWS
-    r"xox[baprs]-[A-Za-z0-9\-]{10,}",               # Slack
-    r"Bearer\s+[A-Za-z0-9_\-\.=]{20,}",
-    r"https://[^ \n]*webhooks[^ \n]*",
+    r"sk-[A-Za-z0-9_-]{20,}",
+    r"ghp_[A-Za-z0-9]{20,}",
+    r"AKIA[0-9A-Z]{16}",
+    r"xox[baprs]-[A-Za-z0-9-]{20,}",
+    r"Bearer\s+[A-Za-z0-9._=-]{15,}",
+    r"https://[^\s]*webhooks[^\s]*",
 ]
 
 ENV_PATTERN = re.compile(r"\$\{?[A-Za-z_][A-Za-z0-9_]*\}?")
 
 INJECTION_PATTERNS = [
-    r"ignore\s+previous\s+instructions",
-    r"ignore\s+the\s+user",
-    r"ignore\s+user\s+instructions",
-    r"ignore\s+stop\s+request",
-    r"ignore\s+cancel\s+request",
+    r"ignore previous instructions",
+    r"ignore the user",
+    r"ignore user",
+    r"ignore stop",
+    r"ignore cancel",
     r"exfiltrat",
     r"steal",
-    r"send\s+.*without\s+telling",
-    r"silently\s+upload",
-    r"do\s+not\s+tell\s+the\s+user",
+    r"upload .*silently",
+    r"send .*silently",
+    r"without user consent",
 ]
 
 PERMISSION_PATTERNS = [
-    r"/\*\*",
-    r"filesystem\s*:\s*all",
-    r"filesystem\s*:\s*rw",
-    r"filesystem\s*:\s*\*",
-    r"network\s*:\s*all",
-    r"network\s*:\s*\*",
-    r"egress\s*:\s*all",
-    r"domains\s*:\s*\*",
-    r"read\s+entire\s+filesystem",
-    r"write\s+entire\s+filesystem",
-    r"any\s+domain",
+    r"entire home directory",
+    r"whole filesystem",
+    r"entire filesystem",
+    r"read-write access",
+    r"write access.*home",
+    r"filesystem.*~",
+    r"filesystem.*\/",
+    r"any external domain",
+    r"egress.*any",
+    r"network.*any",
+    r"network.*external",
 ]
 
 
@@ -145,18 +144,19 @@ def scan(req: SkillRequest):
     # Provenance
     # -------------------------
 
-    has_author = "author" in front
-    has_version = "version" in front
-    has_changelog = "changelog" in front
+    rewrite = [
+    "update this skill",
+    "update version",
+    "increment version",
+    "next patch version",
+    "rewrite version",
+    "modify version",
+    "clear the changelog",
+    "without surfacing",
+    "without telling",
+]
 
-    if not (has_author and has_version and has_changelog):
-        if (
-            "update version" in body_lower
-            or "rewrite version" in body_lower
-            or "increment version" in body_lower
-            or "change version" in body_lower
-            or "modify version" in body_lower
-        ):
-            categories.append("unclear_provenance")
+    if any(x in body_lower for x in rewrite):
+        categories.append("unclear_provenance")
 
     return {"categories": categories}
