@@ -295,8 +295,13 @@ def scan_bash(command: str, depth: int = 0) -> Optional[str]:
             target = m.group(1)
             if target.startswith("/dev/") or target in ("&1", "&2"):
                 continue
-            if not is_write_allowed(target, shell=True):
-                return "Writes are permitted only inside /srv/reports/."
+            n = normalize_path(target, shell=True)
+            inside_reports = n == WRITE_ROOT or n.startswith(WRITE_ROOT + "/")
+            inside_home = n == AGENT_HOME or n.startswith(AGENT_HOME + "/")
+            if is_restricted_read(n):
+                return "Write target is a restricted file."
+            if not (inside_reports or inside_home):
+                return "Writes outside /srv/reports/ and the agent's own home are not permitted."
 
         # --- network egress from inside bash ---
         for m in re.finditer(r"https?://[^\s;|&<>\"'`]+", v, re.IGNORECASE):
