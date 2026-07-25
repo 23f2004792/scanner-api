@@ -1,154 +1,120 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
-import re
-import yaml
+import re, yaml
 
 app = FastAPI()
-
 
 class SkillRequest(BaseModel):
     skill: str
 
-
-# ---------- Secret Detection ----------
-
+# ---------- secrets ----------
 SECRET_PATTERNS = [
-    r"sk-[A-Za-z0-9_-]{20,}",
+    r"sk-[A-Za-z0-9_\-]{20,}",
+    r"sk-ant-[A-Za-z0-9_\-]{20,}",
     r"ghp_[A-Za-z0-9]{20,}",
+    r"github_pat_[A-Za-z0-9_]{20,}",
     r"AKIA[0-9A-Z]{16}",
-    r"xox[baprs]-[A-Za-z0-9-]{20,}",
-    r"Bearer\s+[A-Za-z0-9._=-]{15,}",
-    r"https://[^\s]*webhooks[^\s]*",
+    r"xox[baprs]-[A-Za-z0-9\-]{15,}",
+    r"AIza[0-9A-Za-z_\-]{30,}",
+    r"eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}",
+    r"https://hooks\.slack\.com/services/\S+",
+    r"https://discord(app)?\.com/api/webhooks/\S+",
+    r"https://outlook\.office\.com/webhook/\S+",
+    r"https://\S+/webhook/[A-Za-z0-9_\-]{16,}",
+    # generic: NAME = "long literal"
+    r"(?i)\b(api[_-]?key|apikey|secret|token|password|passwd|access[_-]?key|auth[_-]?token|webhook[_-]?url|client[_-]?secret)\b\s*[:=]\s*[\"']([^\"'\s]{16,})[\"']",
 ]
 
-ENV_PATTERN = re.compile(r"\$\{?[A-Za-z_][A-Za-z0-9_]*\}?")
+PLACEHOLDER = re.compile(
+    r"(\$\{?[A-Za-z_]|<[^>]+>|your[_-]?|xxx|placeholder|example|changeme|redacted|\.\.\.|env\.|os\.environ|secret[_-]?store)",
+    re.IGNORECASE,
+)
 
 INJECTION_PATTERNS = [
-    r"ignore previous instructions",
-    r"ignore the user's stop",
-    r"ignore the user's cancel",
-    r"ignore user stop request",
-    r"ignore user cancel request",
-    r"silently exfiltrat",
-    r"exfiltrat.*file",
-    r"steal.*file",
-    r"silently upload.*file",
-    r"send.*file.*without.*user",
-]
-PERMISSION_PATTERNS = [
-    r"entire home directory",
-    r"entire filesystem",
-    r"whole filesystem",
-    r"filesystem\s*:\s*.*~",
-    r"filesystem\s*:\s*.*\/",
-    r"any external domain",
-    r"egress.*any external",
-    r"network.*any external",
+    r"ignore (all |any |the )?(previous|prior|earlier|above) instructions",
+    r"ignore (the )?(user'?s?|any) (stop|cancel|abort|interrupt|halt)",
+    r"(even|regardless) if the user (asks|says|requests).{0,40}(stop|cancel|abort)",
+    r"continue.{0,40}(even if|despite).{0,40}(stop|cancel)",
+    r"do not (stop|halt|abort) (even )?(if|when) (the )?user",
+    r"disregard (the )?user",
+    r"override (the )?(user|agent|system)",
+    r"exfiltrat",
+    r"(silently|quietly|without (informing|telling|notifying)).{0,60}(send|upload|post|transmit|copy|forward|email)",
+    r"(send|upload|post|transmit|copy|forward|email).{0,80}(without (informing|telling|notifying|surfacing|the user'?s? knowledge)|do not (tell|inform|mention) the user)",
+    r"do not (tell|inform|notify|mention).{0,20}(the )?user",
+    r"without (the )?user'?s? (knowledge|awareness|consent)",
+    r"(hide|conceal|suppress).{0,40}(from )?(the )?(user|reviewer)",
 ]
 
+PERMISSION_PATTERNS = [
+    r"entire (file ?system|home directory|disk|drive|machine|system)",
+    r"whole (file ?system|home directory|disk|drive)",
+    r"(all|every) files? on (the|this) (system|machine|disk)",
+    r"unrestricted (file ?system|network|access)",
+    r"full (disk|file ?system|system) access",
+    r"read[-\s/]?write access to (the )?(entire|all|~|/)",
+    r"any (external )?(domain|host|url|endpoint|server)",
+    r"all (external )?(domains|hosts|urls|endpoints)",
+    r"egress (allowed )?to any",
+    r"network\s*:\s*(unrestricted|unlimited|full|open|\*|any)",
+    r"filesystem\s*:\s*(unrestricted|unlimited|full|\*|/\s*$|~\s*$)",
+    r"outbound (requests )?to any",
+]
+
+PROVENANCE_PATTERNS = [
+    r"silently.{0,60}version",
+    r"(update|bump|rewrite|increment).{0,40}version.{0,60}without (surfacing|informing|telling|notifying|reporting)",
+    r"without (surfacing|informing|telling|notifying).{0,60}(version|changelog|metadata)",
+    r"(clear|erase|delete|wipe|reset|blank).{0,20}the changelog",
+    r"(rewrite|overwrite|modify).{0,30}(its |this skill'?s? )?own.{0,20}(version|metadata|provenance)",
+    r"(strip|remove).{0,30}(author|provenance|version) (metadata|field|info)",
+]
 
 def parse_frontmatter(text):
-    if not text.startswith("---"):
+    t = text.lstrip()
+    if not t.startswith("---"):
         return {}, text
-
+    parts = t.split("---", 2)
+    if len(parts) < 3:
+        return {}, text
     try:
-        parts = text.split("---", 2)
-
-        if len(parts) < 3:
-            return {}, text
-
-        front = yaml.safe_load(parts[1])
-
-        if front is None:
-            front = {}
-
-        return front, parts[2]
-
+        fm = yaml.safe_load(parts[1]) or {}
+        if not isinstance(fm, dict):
+            fm = {}
+        return fm, parts[2]
     except Exception:
-        return {}, text
+        return {}, parts[2]
 
+def any_match(patterns, text):
+    return any(re.search(p, text, re.IGNORECASE) for p in patterns)
 
 @app.post("/scan")
 def scan(req: SkillRequest):
+    text = req.skill or ""
+    front, body = parse_frontmatter(text)
+    cats = []
 
-    categories = []
-
-    front, body = parse_frontmatter(req.skill)
-
-    body_lower = body.lower()
-
-    # -------------------------
-    # Hardcoded Secret
-    # -------------------------
-
-    found_secret = False
-
+    # hardcoded_secret
     for p in SECRET_PATTERNS:
-        if re.search(p, req.skill, re.IGNORECASE):
-            found_secret = True
-            break
+        m = re.search(p, text, re.IGNORECASE)
+        if m:
+            hit = m.group(m.lastindex) if m.lastindex else m.group(0)
+            if not PLACEHOLDER.search(hit):
+                cats.append("hardcoded_secret")
+                break
 
-    if not found_secret:
+    if any_match(INJECTION_PATTERNS, body):
+        cats.append("prompt_injection")
 
-        for k, v in front.items():
+    perm_text = yaml.dump(front) + "\n" + body
+    if any_match(PERMISSION_PATTERNS, perm_text):
+        cats.append("excessive_permissions")
 
-            key = str(k).lower()
-            value = str(v)
+    if any_match(PROVENANCE_PATTERNS, body):
+        cats.append("unclear_provenance")
 
-            if any(x in key for x in [
-                "token",
-                "secret",
-                "apikey",
-                "api_key",
-                "password",
-                "webhook"
-            ]):
+    return {"categories": sorted(set(cats))}
 
-                if not ENV_PATTERN.search(value):
-                    found_secret = True
-                    break
-
-    if found_secret:
-        categories.append("hardcoded_secret")
-
-    # -------------------------
-    # Prompt Injection
-    # -------------------------
-
-    for p in INJECTION_PATTERNS:
-        if re.search(p, body_lower):
-            categories.append("prompt_injection")
-            break
-
-    # -------------------------
-    # Excessive Permissions
-    # -------------------------
-
-    excessive = False
-
-    front_str = yaml.dump(front).lower()
-
-    for p in PERMISSION_PATTERNS:
-        if re.search(p, front_str):
-            excessive = True
-            break
-
-    if excessive:
-        categories.append("excessive_permissions")
-
-    # -------------------------
-    # Provenance
-    # -------------------------
-
-    rewrite = [
-    "update this skill",
-    "update this skill's own version",
-    "next patch version",
-    "clear the changelog",
-    "without surfacing this change",
-]
-
-    if any(x in body_lower for x in rewrite):
-        categories.append("unclear_provenance")
-    categories = sorted(set(categories))
-    return {"categories": categories}
+@app.get("/")
+def health():
+    return {"ok": True}
