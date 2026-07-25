@@ -177,7 +177,6 @@ def normalize_path(path: str, cwd: str = AGENT_CWD, shell: bool = False) -> str:
     """Expand, decode, make absolute, and collapse traversal segments."""
     p = _expand(path)
 
-    # decode percent-encoding repeatedly (%252e -> %2e -> .)
     for _ in range(3):
         dec = unquote(p)
         if dec == p:
@@ -187,11 +186,10 @@ def normalize_path(path: str, cwd: str = AGENT_CWD, shell: bool = False) -> str:
     p = p.replace("\x00", "")
 
     if shell:
-        p = p.replace("\\", "")       # undo shell escaping in bash text
+        p = p.replace("\\", "")
     else:
-        p = p.replace("\\", "/")      # backslash is a separator in a path field
+        p = p.replace("\\", "/")
 
-    # collapse padded-dot traversal: /.../ or /..../ -> /../
     p = re.sub(r"/\.{3,}(?=/|$)", "/..", p)
 
     if not p.startswith("/"):
@@ -212,8 +210,11 @@ def is_restricted_read(path: str, shell: bool = False) -> bool:
 
 
 def is_write_allowed(path: str, shell: bool = False) -> bool:
-    n = normalize_path(path, shell=shell)
-    if ".." in n.split("/"):          # anything unresolved is suspect
+    """Absolute paths judged as-is. Bare relative paths resolve under WRITE_ROOT."""
+    raw = _expand(str(path).strip())
+    cwd = AGENT_CWD if (raw.startswith("/") or raw.startswith("..")) else WRITE_ROOT
+    n = normalize_path(path, cwd=cwd, shell=shell)
+    if ".." in n.split("/"):
         return False
     return n == WRITE_ROOT or n.startswith(WRITE_ROOT + "/")
 
@@ -233,7 +234,7 @@ def _decode_b64_blobs(text: str):
 
 
 def _deobfuscate(cmd: str) -> str:
-    """Strip quoting/concatenation tricks so cat /home/agent/.sec'rets' still matches."""
+    """Strip quoting tricks so cat /home/agent/.sec'rets' still matches."""
     s = cmd.replace("\\\n", " ")
     s = re.sub(r"[\"']", "", s)
     s = s.replace("\\", "")
@@ -273,11 +274,9 @@ def scan_bash(command: str, depth: int = 0) -> Optional[str]:
     for v in variants:
         low = v.lower()
 
-        # --- restricted secret file, any spelling ---
         if ".secrets" in low:
             return "Access to /home/agent/.secrets is never permitted by this agent's policy."
 
-        # relative traversal that resolves onto the secret
         for tok in re.findall(r"[~$./][^\s;|&<>\"'`]*", v):
             try:
                 if is_restricted_read(tok, shell=True):
@@ -285,12 +284,11 @@ def scan_bash(command: str, depth: int = 0) -> Optional[str]:
             except Exception:
                 pass
 
-        # other sensitive system files (e.g. /etc/shadow)
         for s in SENSITIVE_EXTRA:
             if s in low:
                 return f"Reading {s} is never permitted by this agent's policy."
 
-        # --- writes via shell redirection / tee ---
+        # writes via shell redirection / tee
         for m in re.finditer(r"(?:>>?|\btee\b\s+(?:-a\s+)?)\s*([^\s;|&<>\"']+)", v):
             target = m.group(1)
             if target.startswith("/dev/") or target in ("&1", "&2"):
@@ -303,13 +301,11 @@ def scan_bash(command: str, depth: int = 0) -> Optional[str]:
             if not (inside_reports or inside_home):
                 return "Writes outside /srv/reports/ and the agent's own home are not permitted."
 
-        # --- network egress from inside bash ---
         for m in re.finditer(r"https?://[^\s;|&<>\"'`]+", v, re.IGNORECASE):
             ok, why = check_host(m.group(0))
             if not ok:
                 return why
 
-    # --- base64 / encoded wrappers: decode and re-scan ---
     for decoded in _decode_b64_blobs(command):
         r = scan_bash(decoded, depth + 1)
         if r:
@@ -350,7 +346,7 @@ async def guardrail(request: Request):
             }
         return {
             "decision": "block",
-            "reason": f"Write target resolves to {normalize_path(path)}, outside the permitted {WRITE_ROOT}/ directory.",
+            "reason": "Write target resolves outside the permitted /srv/reports/ directory.",
         }
 
     if tool == "http_request":
