@@ -645,8 +645,8 @@ async def mcp_delete(request: Request):
 import os
 import ipaddress
 import socket
-import posixpath
 import tempfile
+import unicodedata
 import httpx
 from urllib.parse import urlsplit, unquote
 
@@ -712,28 +712,54 @@ SEEDED = _seed_files()
 # ---------------- read_file ----------------
 
 def _decode_segment(seg: str) -> str:
-    """Fully percent-decode one path segment (handles double-encoding)."""
+    """Fully percent-decode one segment, including double-encoded forms."""
     prev = seg
     for _ in range(4):
-        cur = unquote(prev)
+        try:
+            cur = unquote(prev, encoding="utf-8", errors="replace")
+        except Exception:
+            cur = unquote(prev)
         if cur == prev:
             break
         prev = cur
+    try:
+        prev = unicodedata.normalize("NFKC", prev)
+    except Exception:
+        pass
     return prev
+
+
+def _looks_like_dotdot(s: str) -> bool:
+    """True if the segment is effectively '..' after stripping decoration."""
+    if not s:
+        return False
+    # strip path-parameter suffix (..;jsessionid=x), trailing dots/spaces/nulls
+    t = s.split(";", 1)[0]
+    t = t.strip().strip("\x00").rstrip(". ").strip()
+    if t == "..":
+        return True
+    core = s.strip().replace(" ", "").replace("\x00", "")
+    return len(core) >= 2 and set(core) == {"."}
 
 
 def _rt_logical_resolve(path: str):
     """
     Segment-wise resolution. A segment counts as traversal only if the WHOLE
-    segment is '..' (literally, after full percent-decoding, or as padded dots).
-    Filenames that merely contain '..' or '%2e%2e' are preserved verbatim.
+    segment is effectively '..'. Filenames that merely contain '..' or
+    '%2e%2e' are preserved verbatim.
     """
     if not isinstance(path, str) or not path.strip():
         return None, "Empty path."
 
     p = path.strip()
-    if "\x00" in p or "%00" in p.lower():
+    low = p.lower()
+    if "\x00" in p or "%00" in low:
         return None, "Null byte in path."
+
+    # overlong / non-standard encodings are never legitimate here
+    for bad in ("%c0%ae", "%c1%9c", "%e0%80%ae", "%uff0e", "%u002e", "%25"):
+        if bad in low:
+            return None, "Non-standard percent encoding in path."
 
     p = p.replace("\\", "/")
 
@@ -751,22 +777,14 @@ def _rt_logical_resolve(path: str):
         if dec != raw and ("/" in dec or "\\" in dec):
             return None, "Encoded path separator in segment."
 
-        # traversal: literal '..', encoded '..', or padded dots ('...', '....')
-        is_traversal = (
-            raw == ".."
-            or dec == ".."
-            or (len(raw) >= 2 and set(raw) == {"."})
-            or (len(dec) >= 2 and set(dec) == {"."})
-        )
-
-        if is_traversal:
+        if _looks_like_dotdot(raw) or _looks_like_dotdot(dec):
             if parts:
                 parts.pop()
             else:
                 return None, "Path traverses above the filesystem root."
             continue
 
-        if dec == ".":
+        if dec == "." or dec.strip() == ".":
             continue
 
         parts.append(raw)          # keep the ORIGINAL, undecoded segment
@@ -879,14 +897,15 @@ def _rt_check_url(url: str):
     if not host:
         return False, "No host in URL.", ""
 
-    # exactly one trailing dot is legal; anything more is a lookalike
-    if host.endswith("."):
-        host = host[:-1]
-    if "." not in host or host.endswith(".") or ".." in host:
+    # any trailing/leading dot is treated as a lookalike, not normalized away
+    if host.endswith(".") or host.startswith(".") or ".." in host:
+        return False, f"Malformed host '{host}'.", host
+
+    if "." not in host:
         return False, f"Malformed host '{host}'.", host
 
     labels = host.split(".")
-    if any(lbl == "" for lbl in labels):
+    if any(lbl == "" or lbl.startswith("-") or lbl.endswith("-") for lbl in labels):
         return False, f"Malformed host '{host}'.", host
 
     try:
@@ -898,9 +917,17 @@ def _rt_check_url(url: str):
     if host not in ALLOWED_FETCH_HOSTS:
         return False, f"Host '{host}' is not on the allowlist.", host
 
+    # only standard web ports on allowlisted hosts
+    try:
+        port = parts.port
+    except Exception:
+        return False, "Malformed port in URL.", host
+    if port is not None and port not in (80, 443):
+        return False, f"Port {port} is not permitted.", host
+
     try:
         infos = socket.getaddrinfo(
-            host, parts.port or (443 if scheme == "https" else 80),
+            host, port or (443 if scheme == "https" else 80),
             proto=socket.IPPROTO_TCP)
     except Exception:
         return False, f"Host '{host}' could not be resolved.", host
