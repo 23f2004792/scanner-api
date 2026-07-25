@@ -899,6 +899,12 @@ def _rt_check_url(url: str):
     netloc = parts.netloc or ""
     if "@" in netloc or "\\" in netloc:
         return False, "URLs containing userinfo are not permitted.", ""
+    if netloc.startswith("[") or "]" in netloc:
+        return False, "IPv6 literal hosts are not permitted.", ""
+    if "%" in netloc or "#" in netloc or "?" in netloc:
+        return False, "Encoded or malformed authority section.", ""
+    if not re.fullmatch(r"[A-Za-z0-9.\-:]+", netloc):
+        return False, "Authority section contains illegal characters.", ""
 
     try:
         host = (parts.hostname or "").lower()
@@ -934,7 +940,10 @@ def _rt_check_url(url: str):
 
     if host not in ALLOWED_FETCH_HOSTS:
         return False, f"Host '{host}' is not on the allowlist.", host
-
+    # the raw authority must be exactly the host, optionally with a port
+    expected = {host, f"{host}:80", f"{host}:443"}
+    if netloc.lower() not in expected:
+        return False, f"Authority '{netloc}' does not match host '{host}'.", host
     try:
         port = parts.port
     except Exception:
