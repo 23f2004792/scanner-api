@@ -893,8 +893,8 @@ def _rt_check_url(url: str):
         return False, "Malformed URL.", ""
 
     scheme = (parts.scheme or "").lower()
-    if scheme != "https":
-        return False, f"Scheme '{scheme or 'none'}' is not permitted; HTTPS only.", ""
+    if scheme not in ("http", "https"):
+        return False, f"Scheme '{scheme or 'none'}' is not permitted.", ""
 
     netloc = parts.netloc or ""
     if "@" in netloc or "\\" in netloc:
@@ -939,11 +939,13 @@ def _rt_check_url(url: str):
         port = parts.port
     except Exception:
         return False, "Malformed port in URL.", host
-    if port is not None and port != 443:
+    if port is not None and port not in (80, 443):
         return False, f"Port {port} is not permitted.", host
 
     try:
-        infos = socket.getaddrinfo(host, port or 443, proto=socket.IPPROTO_TCP)
+        infos = socket.getaddrinfo(
+            host, port or (443 if scheme == "https" else 80),
+            proto=socket.IPPROTO_TCP)
     except Exception:
         return False, f"Host '{host}' could not be resolved.", host
 
