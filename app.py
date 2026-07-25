@@ -118,3 +118,25 @@ def scan(req: SkillRequest):
 @app.get("/")
 def health():
     return {"ok": True}
+
+class ProrationRequest(BaseModel):
+    old_price: float = 0
+    new_price: float = 0
+    days_remaining: float = 0
+    days_in_actual_month: float = 30
+    spec: str = "v1"
+
+
+@app.post("/prorate")
+def prorate(req: ProrationRequest):
+    delta = req.new_price - req.old_price
+    spec = (req.spec or "v1").strip().lower()
+
+    if spec == "v2":
+        divisor = req.days_in_actual_month
+        if not divisor:
+            divisor = 30
+    else:
+        divisor = 30
+
+    return {"charge": delta * (req.days_remaining / divisor)}
