@@ -4,6 +4,16 @@ import re, yaml
 
 app = FastAPI()
 
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["Mcp-Session-Id"],
+)
+
 class SkillRequest(BaseModel):
     skill: str
 
@@ -460,3 +470,170 @@ async def runguard(request: Request):
         "decision": "continue",
         "reason": f"{remaining} tokens remain and the trailing steps show progress, not a loop.",
     }
+
+
+
+# ============================================================
+# MCP server — Streamable HTTP transport
+# ============================================================
+
+import hashlib
+import json as _mcp_json
+import uuid
+from fastapi.responses import JSONResponse, Response
+
+EXAM_EMAIL = "23f2004792@ds.study.iitm.ac.in"
+MCP_PROTOCOL_VERSION = "2025-06-18"
+SUPPORTED_PROTOCOLS = {"2025-06-18", "2025-03-26", "2024-11-05"}
+
+TOOL_DEF = {
+    "name": "solve_challenge",
+    "description": (
+        "Reads the X-Exam-Challenge HTTP header for this call and returns the "
+        "first 16 lowercase hex characters of SHA-256(\"<challenge>:<email>\")."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": True,
+    },
+}
+
+
+def _solve(challenge: str) -> str:
+    email = EXAM_EMAIL.strip().lower()
+    payload = f"{challenge}:{email}".encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()[:16]
+
+
+def _get_challenge(request: Request) -> str:
+    # Starlette headers are case-insensitive; check a few spellings anyway.
+    for key in ("x-exam-challenge", "X-Exam-Challenge", "x_exam_challenge"):
+        val = request.headers.get(key)
+        if val:
+            return val.strip()
+    return ""
+
+
+def _rpc_result(req_id, result):
+    return {"jsonrpc": "2.0", "id": req_id, "result": result}
+
+
+def _rpc_error(req_id, code, message):
+    return {"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}}
+
+
+def _wants_sse(request: Request) -> bool:
+    accept = (request.headers.get("accept") or "").lower()
+    return "text/event-stream" in accept and "application/json" not in accept
+
+
+def _respond(request: Request, payload, session_id=None):
+    """Return JSON or SSE depending on what the client asked for."""
+    headers = {}
+    if session_id:
+        headers["Mcp-Session-Id"] = session_id
+
+    if _wants_sse(request):
+        body = "event: message\ndata: " + _mcp_json.dumps(payload) + "\n\n"
+        headers["Cache-Control"] = "no-cache"
+        return Response(content=body, media_type="text/event-stream", headers=headers)
+
+    return JSONResponse(content=payload, headers=headers)
+
+
+def _handle_rpc(message, request: Request):
+    """Process one JSON-RPC message. Returns (payload_or_None, session_id_or_None)."""
+    if not isinstance(message, dict):
+        return _rpc_error(None, -32600, "Invalid Request"), None
+
+    method = message.get("method")
+    req_id = message.get("id")
+    is_notification = "id" not in message
+
+    if method == "initialize":
+        params = message.get("params") or {}
+        client_ver = params.get("protocolVersion")
+        version = client_ver if client_ver in SUPPORTED_PROTOCOLS else MCP_PROTOCOL_VERSION
+        session_id = uuid.uuid4().hex
+        return _rpc_result(req_id, {
+            "protocolVersion": version,
+            "capabilities": {"tools": {"listChanged": False}},
+            "serverInfo": {"name": "exam-challenge-server", "version": "1.0.0"},
+        }), session_id
+
+    if method in ("notifications/initialized", "initialized", "notifications/cancelled"):
+        return None, None
+
+    if method == "ping":
+        return _rpc_result(req_id, {}), None
+
+    if method == "tools/list":
+        return _rpc_result(req_id, {"tools": [TOOL_DEF]}), None
+
+    if method == "tools/call":
+        params = message.get("params") or {}
+        name = params.get("name")
+        if name != "solve_challenge":
+            return _rpc_error(req_id, -32602, f"Unknown tool: {name}"), None
+
+        challenge = _get_challenge(request)
+        if not challenge:
+            return _rpc_result(req_id, {
+                "content": [{"type": "text", "text": "missing X-Exam-Challenge header"}],
+                "isError": True,
+            }), None
+
+        return _rpc_result(req_id, {
+            "content": [{"type": "text", "text": _solve(challenge)}],
+            "isError": False,
+        }), None
+
+    if method in ("resources/list", "prompts/list"):
+        key = "resources" if method.startswith("resources") else "prompts"
+        return _rpc_result(req_id, {key: []}), None
+
+    if is_notification:
+        return None, None
+
+    return _rpc_error(req_id, -32601, f"Method not found: {method}"), None
+
+
+@app.post("/mcp")
+async def mcp_post(request: Request):
+    try:
+        raw = await request.body()
+        message = _mcp_json.loads(raw) if raw else {}
+    except Exception:
+        return JSONResponse(_rpc_error(None, -32700, "Parse error"), status_code=400)
+
+    # batch request
+    if isinstance(message, list):
+        results = []
+        session_id = None
+        for m in message:
+            payload, sid = _handle_rpc(m, request)
+            if sid:
+                session_id = sid
+            if payload is not None:
+                results.append(payload)
+        if not results:
+            return Response(status_code=202)
+        return _respond(request, results, session_id)
+
+    payload, session_id = _handle_rpc(message, request)
+    if payload is None:
+        return Response(status_code=202)   # notification: no body
+    return _respond(request, payload, session_id)
+
+
+@app.get("/mcp")
+async def mcp_get(request: Request):
+    # Optional server-initiated SSE stream; we have nothing to push.
+    return Response(status_code=405, headers={"Allow": "POST, DELETE"})
+
+
+@app.delete("/mcp")
+async def mcp_delete(request: Request):
+    return Response(status_code=204)
