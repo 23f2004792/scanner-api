@@ -733,7 +733,6 @@ def _looks_like_dotdot(s: str) -> bool:
     """True if the segment is effectively '..' after stripping decoration."""
     if not s:
         return False
-    # strip path-parameter suffix (..;jsessionid=x), trailing dots/spaces/nulls
     t = s.split(";", 1)[0]
     t = t.strip().strip("\x00").rstrip(". ").strip()
     if t == "..":
@@ -753,8 +752,20 @@ def _rt_logical_resolve(path: str):
 
     p = path.strip()
     low = p.lower()
+
     if "\x00" in p or "%00" in low:
         return None, "Null byte in path."
+
+    # not a plain filesystem path: URL schemes, UNC shares, drive letters
+    if "://" in low or low.startswith(("file:", "http:", "https:", "ftp:",
+                                       "data:", "gopher:", "dict:", "\\\\")):
+        return None, "Path is not a plain filesystem path."
+    if len(p) >= 2 and p[1] == ":" and p[0].isalpha():
+        return None, "Drive-letter paths are not permitted."
+    if p.startswith("//"):
+        return None, "UNC-style paths are not permitted."
+    if "\n" in p or "\r" in p:
+        return None, "Newline in path."
 
     # overlong / non-standard encodings are never legitimate here
     for bad in ("%c0%ae", "%c1%9c", "%e0%80%ae", "%uff0e", "%u002e", "%25"):
@@ -848,13 +859,13 @@ def _rt_read_file(path: str):
                     "reason": "Path resolves inside the permitted sandbox root.",
                     "result": {"content": data}}
     except Exception as e:
-        return {"action": "allow",
-                "reason": "Path resolves inside the permitted sandbox root.",
-                "result": {"content": f"error reading file: {e}"}}
+        return {"action": "block",
+                "reason": f"Path could not be read: {e}",
+                "result": None}
 
-    return {"action": "allow",
-            "reason": "Path is inside the sandbox root but no such file exists.",
-            "result": {"content": ""}}
+    return {"action": "block",
+            "reason": "No such file inside the sandbox root.",
+            "result": None}
 
 
 # ---------------- fetch_url ----------------
@@ -876,8 +887,12 @@ def _rt_check_url(url: str):
     if not isinstance(url, str) or not url.strip():
         return False, "Empty URL.", ""
 
+    raw = url.strip()
+    if "\n" in raw or "\r" in raw or "\x00" in raw:
+        return False, "Control character in URL.", ""
+
     try:
-        parts = urlsplit(url.strip())
+        parts = urlsplit(raw)
     except Exception:
         return False, "Malformed URL.", ""
 
@@ -886,7 +901,7 @@ def _rt_check_url(url: str):
         return False, f"Scheme '{scheme or 'none'}' is not permitted.", ""
 
     netloc = parts.netloc or ""
-    if "@" in netloc:
+    if "@" in netloc or "\\" in netloc:
         return False, "URLs containing userinfo are not permitted.", ""
 
     try:
@@ -897,7 +912,6 @@ def _rt_check_url(url: str):
     if not host:
         return False, "No host in URL.", ""
 
-    # any trailing/leading dot is treated as a lookalike, not normalized away
     if host.endswith(".") or host.startswith(".") or ".." in host:
         return False, f"Malformed host '{host}'.", host
 
@@ -917,7 +931,6 @@ def _rt_check_url(url: str):
     if host not in ALLOWED_FETCH_HOSTS:
         return False, f"Host '{host}' is not on the allowlist.", host
 
-    # only standard web ports on allowlisted hosts
     try:
         port = parts.port
     except Exception:
@@ -949,10 +962,13 @@ def _rt_fetch_url(url: str):
         with httpx.Client(follow_redirects=False, timeout=6.0) as client:
             for _ in range(5):
                 resp = client.get(current, headers={"User-Agent": "guardrail/1.0"})
+
                 if resp.status_code in (301, 302, 303, 307, 308):
                     nxt = resp.headers.get("location")
                     if not nxt:
-                        break
+                        return {"action": "block",
+                                "reason": "Redirect without a target.",
+                                "result": None}
                     nxt = str(httpx.URL(current).join(nxt))
                     ok2, reason2, _ = _rt_check_url(nxt)
                     if not ok2:
@@ -961,14 +977,18 @@ def _rt_fetch_url(url: str):
                                 "result": None}
                     current = nxt
                     continue
+
                 return {"action": "allow", "reason": reason,
                         "result": {"content": resp.text[:MAX_READ_BYTES],
                                    "status": resp.status_code}}
     except Exception as e:
-        return {"action": "allow", "reason": reason,
-                "result": {"content": f"fetch error: {e}"}}
+        return {"action": "block",
+                "reason": f"Fetch failed: {e}",
+                "result": None}
 
-    return {"action": "allow", "reason": reason, "result": {"content": ""}}
+    return {"action": "block",
+            "reason": "Too many redirects; refusing to follow further.",
+            "result": None}
 
 
 # ---------------- endpoint ----------------
